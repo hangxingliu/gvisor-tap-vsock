@@ -4,9 +4,12 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"net/url"
+	"strings"
 	"sync"
 
 	"github.com/inetaf/tcpproxy"
+	socks5 "github.com/txthinking/socks5"
 	log "github.com/sirupsen/logrus"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
@@ -17,7 +20,10 @@ import (
 
 const linkLocalSubnet = "169.254.0.0/16"
 
-func TCP(s *stack.Stack, nat map[tcpip.Address]tcpip.Address, natLock *sync.Mutex, ec2MetadataAccess bool) *tcp.Forwarder {
+// TCP creates a TCP forwarder that routes outbound connections through an
+// optional proxy.  When proxy is empty, the behaviour is identical to the
+// original direct-connect implementation.
+func TCP(s *stack.Stack, nat map[tcpip.Address]tcpip.Address, natLock *sync.Mutex, ec2MetadataAccess bool, proxy string) *tcp.Forwarder {
 	return tcp.NewForwarder(s, 0, 10, func(r *tcp.ForwarderRequest) {
 		localAddress := r.ID().LocalAddress
 
@@ -31,9 +37,11 @@ func TCP(s *stack.Stack, nat map[tcpip.Address]tcpip.Address, natLock *sync.Mute
 			localAddress = replaced
 		}
 		natLock.Unlock()
-		outbound, err := net.Dial("tcp", net.JoinHostPort(localAddress.String(), fmt.Sprint(r.ID().LocalPort)))
+
+		dest := net.JoinHostPort(localAddress.String(), fmt.Sprint(r.ID().LocalPort))
+		outbound, err := dialTCP(proxy, dest)
 		if err != nil {
-			log.Tracef("net.Dial() = %v", err)
+			log.Tracef("dialTCP() = %v", err)
 			r.Complete(true)
 			return
 		}
@@ -58,6 +66,43 @@ func TCP(s *stack.Stack, nat map[tcpip.Address]tcpip.Address, natLock *sync.Mute
 		}
 		remote.HandleConn(gonet.NewTCPConn(&wq, ep))
 	})
+}
+
+// dialTCP dials dest via proxy (if non-empty) or directly.
+func dialTCP(proxy, dest string) (net.Conn, error) {
+	if proxy == "" {
+		return net.Dial("tcp", dest)
+	}
+
+	u, err := url.Parse(proxy)
+	if err != nil {
+		return nil, fmt.Errorf("invalid proxy URL %q: %w", proxy, err)
+	}
+
+	switch strings.ToLower(u.Scheme) {
+	case "socks5":
+		host := u.Host
+		if _, _, err := net.SplitHostPort(host); err != nil {
+			host = host + ":1080"
+		}
+		username := ""
+		password := ""
+		if u.User != nil {
+			username = u.User.Username()
+			password, _ = u.User.Password()
+		}
+		client, err := socks5.NewClient(host, username, password, 0, 0)
+		if err != nil {
+			return nil, fmt.Errorf("socks5 client: %w", err)
+		}
+		return client.Dial("tcp", dest)
+
+	case "http", "https":
+		return dialHTTPConnect(u, dest)
+
+	default:
+		return nil, fmt.Errorf("unsupported proxy scheme %q", u.Scheme)
+	}
 }
 
 func linkLocal() *tcpip.Subnet {

@@ -59,6 +59,14 @@ type Configuration struct {
 
 	// EC2 Metadata Service Access
 	Ec2MetadataAccess bool `yaml:"ec2MetadataAccess,omitempty"`
+
+	// Proxy is the URL of an HTTP or SOCKS5 proxy to use for outbound TCP (and optionally UDP) traffic.
+	// Supported schemes: http:// and socks5://
+	Proxy string `yaml:"proxy,omitempty"`
+
+	// ProxyUDP enables proxying of UDP traffic through the SOCKS5 proxy specified in Proxy.
+	// Only valid when Proxy uses the socks5:// scheme; ignored otherwise.
+	ProxyUDP bool `yaml:"proxyUDP,omitempty"`
 }
 
 type Protocol string
