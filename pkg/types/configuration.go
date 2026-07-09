@@ -67,6 +67,12 @@ type Configuration struct {
 	// ProxyUDP enables proxying of UDP traffic through the SOCKS5 proxy specified in Proxy.
 	// Only valid when Proxy uses the socks5:// scheme; ignored otherwise.
 	ProxyUDP bool `yaml:"proxyUDP,omitempty"`
+
+	// DNSUpstreams is an optional list of upstream DNS server addresses (e.g. "8.8.8.8:53",
+	// "1.1.1.1") to use instead of the system resolver. When non-empty the system /etc/resolv.conf
+	// is ignored and queries are sent to these servers in order. If a SOCKS5 proxy is also set,
+	// DNS queries to these servers are tunnelled through the proxy.
+	DNSUpstreams []string `yaml:"dnsUpstreams,omitempty"`
 }
 
 type Protocol string

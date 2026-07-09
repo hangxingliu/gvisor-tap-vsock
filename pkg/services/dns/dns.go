@@ -1,17 +1,21 @@
 package dns
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
 	"net"
 	"net/http"
+	"net/url"
+	"os"
 	"strings"
 	"sync"
 
 	"github.com/containers/gvisor-tap-vsock/pkg/types"
 	"github.com/miekg/dns"
 	log "github.com/sirupsen/logrus"
+	socks5 "github.com/txthinking/socks5"
 )
 
 type upstreamResolver interface {
@@ -243,11 +247,134 @@ type Server struct {
 	handler *dnsHandler
 }
 
-func New(udpConn net.PacketConn, tcpLn net.Listener, zones []types.Zone) (*Server, error) {
-	upstream := &net.Resolver{
-		PreferGo: false,
-	}
+// New creates a DNS server. When proxy is a socks5:// URL, upstream DNS
+// queries are forwarded through the SOCKS5 proxy to prevent DNS leaks.
+// HTTP proxies do not support DNS proxying and are silently ignored.
+// When dnsUpstreams is non-empty those addresses are used as the upstream
+// resolvers instead of the host system's /etc/resolv.conf nameservers.
+func New(udpConn net.PacketConn, tcpLn net.Listener, zones []types.Zone, proxy string, dnsUpstreams []string) (*Server, error) {
+	upstream := buildUpstreamResolver(proxy, dnsUpstreams)
 	return NewWithUpstreamResolver(udpConn, tcpLn, zones, upstream)
+}
+
+// buildUpstreamResolver returns a net.Resolver appropriate for the given proxy
+// and upstream DNS configuration.
+//
+//   - dnsUpstreams: explicit nameserver addresses (e.g. "8.8.8.8:53", "1.1.1.1").
+//     When non-empty these override the system /etc/resolv.conf nameservers.
+//     A bare IP without a port has ":53" appended automatically.
+//   - proxy: if a socks5:// URL, all DNS queries are tunnelled through it.
+//     http:// proxies are silently ignored (DNS over HTTP CONNECT is not practical).
+//
+// When both are empty the default system resolver is used unchanged.
+func buildUpstreamResolver(proxy string, dnsUpstreams []string) *net.Resolver {
+	// Normalise custom upstream addresses: append ":53" if no port given.
+	for i, addr := range dnsUpstreams {
+		if _, _, err := net.SplitHostPort(addr); err != nil {
+			dnsUpstreams[i] = net.JoinHostPort(addr, "53")
+		}
+	}
+
+	// Determine whether we need to route through a SOCKS5 proxy.
+	isSocks5 := false
+	var proxyHost, username, password string
+	if proxy != "" {
+		u, err := url.Parse(proxy)
+		if err == nil && strings.EqualFold(u.Scheme, "socks5") {
+			isSocks5 = true
+			proxyHost = u.Host
+			if _, _, err := net.SplitHostPort(proxyHost); err != nil {
+				proxyHost = proxyHost + ":1080"
+			}
+			if u.User != nil {
+				username = u.User.Username()
+				password, _ = u.User.Password()
+			}
+		}
+	}
+
+	// If neither a proxy nor custom upstreams are requested, use the default
+	// system resolver (fastest path, no extra goroutines or deps).
+	if !isSocks5 && len(dnsUpstreams) == 0 {
+		return &net.Resolver{PreferGo: false}
+	}
+
+	// Determine the nameserver list to dial.
+	nameservers := dnsUpstreams
+	if len(nameservers) == 0 {
+		// No custom upstreams – use system nameservers so that the SOCKS5
+		// tunnel still carries queries to the user's normal DNS servers.
+		nameservers = systemNameservers()
+		if len(nameservers) == 0 {
+			// Ultimate fallback: well-known public resolver.
+			nameservers = []string{"8.8.8.8:53"}
+		}
+	}
+
+	return &net.Resolver{
+		PreferGo: true,
+		Dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
+			var lastErr error
+			for _, ns := range nameservers {
+				if isSocks5 {
+					client, err := socks5.NewClient(proxyHost, username, password, 0, 0)
+					if err != nil {
+						lastErr = fmt.Errorf("socks5 client: %w", err)
+						continue
+					}
+					// DNS resolvers accept both TCP and UDP; net.Resolver
+					// will pass "udp" as network when PreferGo=true.
+					// SOCKS5 UDP-Associate is complex; use TCP instead which
+					// is universally supported and sufficient for DNS.
+					conn, err := client.Dial("tcp", ns)
+					if err != nil {
+						lastErr = fmt.Errorf("dial %s via socks5: %w", ns, err)
+						continue
+					}
+					return conn, nil
+				}
+				// Direct connection (custom upstreams, no proxy).
+				conn, err := (&net.Dialer{}).DialContext(ctx, "udp", ns)
+				if err != nil {
+					lastErr = fmt.Errorf("dial %s: %w", ns, err)
+					continue
+				}
+				return conn, nil
+			}
+			return nil, lastErr
+		},
+	}
+}
+
+// systemNameservers reads nameserver addresses from /etc/resolv.conf and
+// returns them as "host:53" strings. Returns nil if the file cannot be read.
+func systemNameservers() []string {
+	f, err := os.Open("/etc/resolv.conf")
+	if err != nil {
+		return nil
+	}
+	defer f.Close()
+
+	var servers []string
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if !strings.HasPrefix(line, "nameserver ") {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		ip := fields[1]
+		if net.ParseIP(ip) != nil {
+			servers = append(servers, net.JoinHostPort(ip, "53"))
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return nil
+	}
+	return servers
 }
 
 func NewWithUpstreamResolver(udpConn net.PacketConn, tcpLn net.Listener, zones []types.Zone, upstream upstreamResolver) (*Server, error) {

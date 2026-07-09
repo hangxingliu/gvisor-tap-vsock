@@ -32,7 +32,7 @@ func addServices(configuration *types.Configuration, s *stack.Stack, ipPool *tap
 	icmpForwarder := forwarder.ICMP(s, translation, &natLock)
 	s.SetTransportProtocolHandler(icmp.ProtocolNumber4, icmpForwarder.HandlePacket)
 
-	dnsMux, err := dnsServer(configuration, s)
+	dnsMux, err := dnsServer(configuration, s, configuration.Proxy, configuration.DNSUpstreams)
 	if err != nil {
 		return nil, err
 	}
@@ -61,7 +61,7 @@ func parseNATTable(configuration *types.Configuration) map[tcpip.Address]tcpip.A
 	return translation
 }
 
-func dnsServer(configuration *types.Configuration, s *stack.Stack) (http.Handler, error) {
+func dnsServer(configuration *types.Configuration, s *stack.Stack, proxy string, dnsUpstreams []string) (http.Handler, error) {
 	udpConn, err := gonet.DialUDP(s, &tcpip.FullAddress{
 		NIC:  1,
 		Addr: tcpip.AddrFrom4Slice(net.ParseIP(configuration.GatewayIP).To4()),
@@ -80,7 +80,7 @@ func dnsServer(configuration *types.Configuration, s *stack.Stack) (http.Handler
 		return nil, err
 	}
 
-	server, err := dns.New(udpConn, tcpLn, configuration.DNS)
+	server, err := dns.New(udpConn, tcpLn, configuration.DNS, proxy, dnsUpstreams)
 	if err != nil {
 		return nil, err
 	}
