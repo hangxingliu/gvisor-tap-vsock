@@ -8,9 +8,10 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/containers/gvisor-tap-vsock/pkg/services/noproxy"
 	"github.com/inetaf/tcpproxy"
-	socks5 "github.com/txthinking/socks5"
 	log "github.com/sirupsen/logrus"
+	socks5 "github.com/txthinking/socks5"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
@@ -68,9 +69,11 @@ func TCP(s *stack.Stack, nat map[tcpip.Address]tcpip.Address, natLock *sync.Mute
 	})
 }
 
-// dialTCP dials dest via proxy (if non-empty) or directly.
+// dialTCP dials dest via proxy (if non-empty) or directly.  Destinations
+// covered by the built-in NO_PROXY policy (loopback, private IPv4/IPv6
+// ranges, ...) are always dialled directly.
 func dialTCP(proxy, dest string) (net.Conn, error) {
-	if proxy == "" {
+	if proxy == "" || noproxy.Bypass(dest) {
 		return net.Dial("tcp", dest)
 	}
 

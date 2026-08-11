@@ -8,8 +8,9 @@ import (
 	"strings"
 	"sync"
 
-	socks5 "github.com/txthinking/socks5"
+	"github.com/containers/gvisor-tap-vsock/pkg/services/noproxy"
 	log "github.com/sirupsen/logrus"
+	socks5 "github.com/txthinking/socks5"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
@@ -50,7 +51,7 @@ func UDP(s *stack.Stack, nat map[tcpip.Address]tcpip.Address, natLock *sync.Mute
 		dest := net.JoinHostPort(localAddress.String(), strconv.Itoa(int(r.ID().LocalPort)))
 
 		var dialer func() (net.Conn, error)
-		if proxyUDP && proxy != "" {
+		if proxyUDP && proxy != "" && !noproxy.Bypass(dest) {
 			dialer = makeSocks5UDPDialer(proxy, dest)
 		} else {
 			dialer = func() (net.Conn, error) {

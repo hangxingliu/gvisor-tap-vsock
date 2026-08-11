@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/containers/gvisor-tap-vsock/pkg/services/noproxy"
 	"github.com/containers/gvisor-tap-vsock/pkg/types"
 	"github.com/miekg/dns"
 	log "github.com/sirupsen/logrus"
@@ -316,7 +317,10 @@ func buildUpstreamResolver(proxy string, dnsUpstreams []string) *net.Resolver {
 		Dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
 			var lastErr error
 			for _, ns := range nameservers {
-				if isSocks5 {
+				// Upstream resolvers on the loopback interface or on the
+				// local network are unreachable through the proxy, dial
+				// them directly.
+				if isSocks5 && !noproxy.Bypass(ns) {
 					client, err := socks5.NewClient(proxyHost, username, password, 0, 0)
 					if err != nil {
 						lastErr = fmt.Errorf("socks5 client: %w", err)
