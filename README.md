@@ -211,6 +211,21 @@ Activate it by changing the `/etc/resolv.conf` file inside the VM with:
 nameserver 192.168.127.1
 ```
 
+Queries that are not answered from a static zone are forwarded to the host resolver.
+Set `stack.dnsUpstreams` (for example `8.8.8.8` or `1.1.1.1:53`) to use those
+servers instead. When `stack.proxy` is a `socks5://` URL, queries to upstreams
+that are not on the local network are sent through that proxy. `http://` proxies
+do not carry DNS, and loopback, link-local, and private upstreams are always
+queried directly.
+
+### Outbound proxy
+
+`stack.proxy` sends guest TCP connections through an HTTP CONNECT or SOCKS5
+proxy. `stack.proxyUDP: true` also sends UDP through a `socks5://` proxy.
+The same local-address bypass as DNS applies, so traffic to the host, the
+virtual network, and other private ranges is dialed directly. With no proxy
+set, forwarding matches upstream gvisor-tap-vsock.
+
 ### Port forwarding
 
 Dynamic port forwarding is supported over the host HTTP API when `gvproxy` was
