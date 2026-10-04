@@ -1,10 +1,12 @@
 package forwarder
 
 import (
+	"context"
 	"net"
 	"strconv"
 	"sync"
 
+	"github.com/containers/gvisor-tap-vsock/pkg/services/netproxy"
 	log "github.com/sirupsen/logrus"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
@@ -14,7 +16,11 @@ import (
 	"gvisor.dev/gvisor/pkg/waiter"
 )
 
-func UDP(s *stack.Stack, nat map[tcpip.Address]tcpip.Address, natLock *sync.Mutex, ec2MetadataAccess bool) *udp.Forwarder {
+// UDP creates a UDP forwarder. When proxyUDP is true and proxy is a socks5://
+// URL, datagrams are sent through the SOCKS5 UDP-associate relay. HTTP proxies
+// do not carry UDP. Destinations covered by the NO_PROXY policy, and every
+// datagram when proxyUDP is false, are sent directly.
+func UDP(s *stack.Stack, nat map[tcpip.Address]tcpip.Address, natLock *sync.Mutex, ec2MetadataAccess bool, proxy string, proxyUDP bool) *udp.Forwarder {
 	return udp.NewForwarder(s, func(r *udp.ForwarderRequest) bool {
 		localAddress := r.ID().LocalAddress
 
@@ -40,8 +46,9 @@ func UDP(s *stack.Stack, nat map[tcpip.Address]tcpip.Address, natLock *sync.Mute
 			return false
 		}
 
+		dest := net.JoinHostPort(localAddress.String(), strconv.Itoa(int(r.ID().LocalPort)))
 		p, _ := NewUDPProxy(&autoStoppingListener{underlying: gonet.NewUDPConn(&wq, ep)}, func(_ net.Addr) (net.Conn, error) {
-			return net.Dial("udp", net.JoinHostPort(localAddress.String(), strconv.Itoa(int(r.ID().LocalPort))))
+			return netproxy.DialUDP(context.Background(), proxy, proxyUDP, dest)
 		})
 		go func() {
 			p.Run()

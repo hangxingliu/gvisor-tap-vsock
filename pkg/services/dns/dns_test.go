@@ -25,7 +25,7 @@ var _ = ginkgo.Describe("dns add test", func() {
 	var server *Server
 
 	ginkgo.BeforeEach(func() {
-		server, _ = New(nil, nil, []types.Zone{})
+		server, _ = New(nil, nil, []types.Zone{}, "", nil)
 	})
 
 	ginkgo.It("should add dns zone with ip", func() {
@@ -168,7 +168,7 @@ var _ = ginkgo.Describe("dns add test", func() {
 					},
 				},
 			},
-		})
+		}, "", nil)
 		gomega.Expect(server.addZone(types.Zone{
 			Name: "testing.",
 			Records: []types.Record{
@@ -242,7 +242,7 @@ var _ = ginkgo.Describe("dns add test", func() {
 	ginkgo.It("should preserve Protected flag when merging into existing zone", func() {
 		server, _ = New(nil, nil, []types.Zone{
 			{Name: "system.internal.", Protected: true, DefaultIP: net.ParseIP("10.0.0.1")},
-		})
+		}, "", nil)
 		err := server.addZone(types.Zone{
 			Name:    "system.internal.",
 			Records: []types.Record{{Name: "api", IP: net.ParseIP("10.0.0.2")}},
@@ -277,7 +277,7 @@ var _ = ginkgo.Describe("dns zone validation", func() {
 				Protected: true,
 				DefaultIP: net.ParseIP("192.168.127.1"),
 			},
-		})
+		}, "", nil)
 	})
 
 	ginkgo.It("should reject empty zone name", func() {

@@ -9,6 +9,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/containers/gvisor-tap-vsock/pkg/apilog"
 	"github.com/containers/gvisor-tap-vsock/pkg/types"
@@ -31,11 +32,16 @@ type dnsHandler struct {
 	zones     []types.Zone
 	zonesLock sync.RWMutex
 	upstream  upstreamResolver
-	// nameservers are the host's upstream DNS servers ("ip:port") used to
-	// forward raw queries for record types that Go's net.Resolver cannot
-	// look up directly (SOA, PTR, AAAA, CAA, ...).
+	// nameservers are the upstream DNS servers ("ip:port") used to forward
+	// raw queries for record types that Go's net.Resolver cannot look up
+	// directly (SOA, PTR, AAAA, CAA, ...). With the default configuration
+	// these are the host's resolvers. DNSUpstreams replaces that list.
 	nameservers []string
 	client      *dns.Client
+	// dialNameserver, when set, dials one upstream for addAnswersFromNameservers.
+	// It is set for a SOCKS5 proxy so those queries are tunnelled too.
+	// network is "udp" or "tcp". A nil dialer means dns.Client dials directly.
+	dialNameserver func(ctx context.Context, network, address string) (net.Conn, error)
 }
 
 func (h *dnsHandler) handle(w dns.ResponseWriter, r *dns.Msg, responseMessageSize int) {
@@ -269,7 +275,7 @@ func (h *dnsHandler) addAnswersFromNameservers(m *dns.Msg, q dns.Question) {
 	req.RecursionDesired = true
 
 	for _, ns := range h.nameservers {
-		resp, _, err := h.client.Exchange(req, ns)
+		resp, err := h.exchangeWithNameserver(req, ns)
 		if err != nil || resp == nil {
 			continue
 		}
@@ -285,6 +291,34 @@ func (h *dnsHandler) addAnswersFromNameservers(m *dns.Msg, q dns.Question) {
 
 	// The upstream servers are known but none could be reached.
 	m.Rcode = dns.RcodeServerFailure
+}
+
+// exchangeWithNameserver sends req to a single upstream. The default path
+// dials that server directly. A SOCKS5 configuration installs dialNameserver
+// so the same query is tunnelled, except for upstreams the NO_PROXY policy
+// says to reach directly.
+func (h *dnsHandler) exchangeWithNameserver(req *dns.Msg, ns string) (*dns.Msg, error) {
+	if h.dialNameserver == nil {
+		resp, _, err := h.client.Exchange(req, ns)
+		return resp, err
+	}
+	// Ask for TCP. A SOCKS5 dial is always a stream, and a bypassed local
+	// resolver is dialed with TCP as well, so miekg writes the length prefix.
+	// The timeout bounds the handshake. miekg's own exchange timeout covers
+	// the query that follows.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	conn, err := h.dialNameserver(ctx, "tcp", ns)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		if err := conn.Close(); err != nil {
+			log.Debugf("close DNS upstream connection: %v", err)
+		}
+	}()
+	resp, _, err := h.client.ExchangeWithConn(req, &dns.Conn{Conn: conn})
+	return resp, err
 }
 
 // hostNameservers returns the upstream DNS servers ("ip:port") configured on
@@ -309,11 +343,29 @@ type Server struct {
 	handler *dnsHandler
 }
 
-func New(udpConn net.PacketConn, tcpLn net.Listener, zones []types.Zone) (*Server, error) {
-	upstream := &net.Resolver{
-		PreferGo: false,
+// New creates a DNS server.
+//
+// proxy is an optional proxy URL. Only socks5:// changes DNS behavior: queries
+// for non-local upstreams are tunnelled through it, which avoids leaking them
+// to the host resolver. http:// and https:// proxies are ignored here because
+// they cannot carry DNS. An empty proxy keeps the host resolver.
+//
+// dnsUpstreams, when non-empty, replaces the host's nameservers. A bare IP
+// without a port uses port 53. With a socks5 proxy, those servers are dialled
+// through the proxy unless the NO_PROXY policy says to dial them directly.
+func New(udpConn net.PacketConn, tcpLn net.Listener, zones []types.Zone, proxy string, dnsUpstreams []string) (*Server, error) {
+	spec := buildUpstreamSpec(proxy, dnsUpstreams)
+	if !spec.customized {
+		return NewWithUpstreamResolver(udpConn, tcpLn, zones, &net.Resolver{PreferGo: false})
 	}
-	return NewWithUpstreamResolver(udpConn, tcpLn, zones, upstream)
+	handler := &dnsHandler{
+		zones:          zones,
+		upstream:       spec.resolver,
+		nameservers:    spec.nameservers,
+		client:         &dns.Client{},
+		dialNameserver: spec.dialNameserver,
+	}
+	return &Server{udpConn: udpConn, tcpLn: tcpLn, handler: handler}, nil
 }
 
 func NewWithUpstreamResolver(udpConn net.PacketConn, tcpLn net.Listener, zones []types.Zone, upstream upstreamResolver) (*Server, error) {

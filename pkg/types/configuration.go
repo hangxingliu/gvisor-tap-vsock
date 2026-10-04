@@ -65,6 +65,24 @@ type Configuration struct {
 
 	// Timeout in seconds for outbound TCP connection attempts (default: 30)
 	TCPConnectTimeout int `yaml:"tcpConnectTimeout,omitempty"`
+
+	// Proxy is an optional HTTP or SOCKS5 proxy for outbound guest TCP
+	// connections, and for UDP when ProxyUDP is set.
+	// Supported schemes are http, https, and socks5.
+	// https uses HTTP CONNECT on a plain TCP connection to the proxy; the
+	// proxy session itself is not wrapped in TLS.
+	// Loopback, link-local, and private destinations bypass the proxy.
+	Proxy string `yaml:"proxy,omitempty"`
+
+	// ProxyUDP routes outbound UDP through Proxy. Only socks5:// proxies
+	// support UDP. Ignored when Proxy is empty or uses another scheme.
+	ProxyUDP bool `yaml:"proxyUDP,omitempty"`
+
+	// DNSUpstreams, when non-empty, replaces the host resolver for queries
+	// the gateway forwards. An address may omit the port; 53 is used then.
+	// With a socks5 Proxy, queries to non-local upstreams are tunnelled
+	// through that proxy. http proxies do not carry DNS.
+	DNSUpstreams []string `yaml:"dnsUpstreams,omitempty"`
 }
 
 type Protocol string
