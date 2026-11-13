@@ -4,12 +4,15 @@ import (
 	"bufio"
 	"context"
 	"encoding/base64"
+	"errors"
 	"io"
 	"net"
 	"net/http"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/containers/gvisor-tap-vsock/pkg/services/noproxy"
 )
 
 func TestDialTCPBypassesProxyForPrivateDestinations(t *testing.T) {
@@ -33,13 +36,13 @@ func TestDialTCPBypassesProxyForPrivateDestinations(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	conn, err := DialTCP(ctx, proxy, ln.Addr().String())
+	conn, err := DialTCP(ctx, Options{Proxy: proxy}, ln.Addr().String())
 	if err != nil {
 		t.Fatalf("DialTCP() to loopback = %v, want direct connection", err)
 	}
 	conn.Close()
 
-	if _, err := DialTCP(ctx, proxy, "93.184.216.34:80"); err == nil {
+	if _, err := DialTCP(ctx, Options{Proxy: proxy}, "93.184.216.34:80"); err == nil {
 		t.Fatal("DialTCP() to a public address unexpectedly succeeded; the proxy was not used")
 	}
 }
@@ -53,7 +56,7 @@ func TestDialTCPThroughHTTPConnect(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	conn, err := DialTCP(ctx, proxy, dest)
+	conn, err := DialTCP(ctx, Options{Proxy: proxy}, dest)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -99,7 +102,7 @@ func TestDialTCPPreservesBytesAfterConnectResponse(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	conn, err := DialTCP(ctx, "http://"+ln.Addr().String(), "93.184.216.34:80")
+	conn, err := DialTCP(ctx, Options{Proxy: "http://" + ln.Addr().String()}, "93.184.216.34:80")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -121,12 +124,12 @@ func TestDialTCPHTTPConnectAuth(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	if _, err := DialTCP(ctx, proxy, dest); err == nil {
+	if _, err := DialTCP(ctx, Options{Proxy: proxy}, dest); err == nil {
 		t.Fatal("DialTCP() without credentials succeeded")
 	}
 
 	authed := "http://user:secret@" + strings.TrimPrefix(proxy, "http://")
-	conn, err := DialTCP(ctx, authed, dest)
+	conn, err := DialTCP(ctx, Options{Proxy: authed}, dest)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -143,18 +146,18 @@ func TestDialUDPBypassAndScheme(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	conn, err := DialUDP(ctx, "socks5://127.0.0.1:1", true, pc.LocalAddr().String())
+	conn, err := DialUDP(ctx, Options{Proxy: "socks5://127.0.0.1:1", ProxyUDP: true}, pc.LocalAddr().String())
 	if err != nil {
 		t.Fatalf("DialUDP() to loopback = %v, want direct connection", err)
 	}
 	conn.Close()
 
-	_, err = DialUDP(ctx, "http://127.0.0.1:8080", true, "93.184.216.34:53")
+	_, err = DialUDP(ctx, Options{Proxy: "http://127.0.0.1:8080", ProxyUDP: true}, "93.184.216.34:53")
 	if err == nil || !strings.Contains(err.Error(), "socks5") {
 		t.Fatalf("DialUDP() via http proxy error = %v, want a socks5-only error", err)
 	}
 
-	_, err = DialUDP(ctx, "socks5://127.0.0.1:1", true, "93.184.216.34:53")
+	_, err = DialUDP(ctx, Options{Proxy: "socks5://127.0.0.1:1", ProxyUDP: true}, "93.184.216.34:53")
 	if err == nil {
 		t.Fatal("DialUDP() to a public address unexpectedly succeeded; the proxy was not used")
 	}
@@ -255,4 +258,102 @@ func handleConnect(c net.Conn, userpass, relayTo string) {
 	}
 	go func() { _, _ = io.Copy(upstream, br) }()
 	_, _ = io.Copy(c, upstream)
+}
+
+func mustPolicy(t *testing.T, list string) *noproxy.Policy {
+	t.Helper()
+	p, err := noproxy.Parse(list)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+func TestDialTCPUsesTheConfiguredBypassList(t *testing.T) {
+	echo := startEcho(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	// The proxy is unreachable: a successful dial proves a direct connection.
+	const proxy = "socks5://127.0.0.1:1"
+	conn, err := DialTCP(ctx, Options{Proxy: proxy, Bypass: mustPolicy(t, "127.0.0.0/8")}, echo)
+	if err != nil {
+		t.Fatalf("listed destination = %v, want a direct connection", err)
+	}
+	conn.Close()
+
+	for _, list := range []string{"", "10.0.0.0/8"} {
+		if _, err := DialTCP(ctx, Options{Proxy: proxy, Bypass: mustPolicy(t, list)}, echo); err == nil {
+			t.Fatalf("bypass list %q: loopback was dialled directly; the proxy was not used", list)
+		}
+	}
+}
+
+func TestDialUDPStrictMode(t *testing.T) {
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pc.Close()
+	dest := pc.LocalAddr().String()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	empty := mustPolicy(t, "")
+
+	for _, opts := range []Options{
+		{Proxy: "http://127.0.0.1:1", Bypass: empty},
+		{Proxy: "socks5://127.0.0.1:1", ProxyUDP: false, Bypass: empty},
+	} {
+		conn, err := DialUDP(ctx, opts, dest)
+		if err != nil {
+			t.Fatalf("%+v non-strict = %v, want a direct dial", opts, err)
+		}
+		conn.Close()
+		if opts.DropsUDP(dest) {
+			t.Fatalf("%+v non-strict DropsUDP = true", opts)
+		}
+
+		opts.Strict = true
+		if _, err := DialUDP(ctx, opts, dest); !errors.Is(err, ErrNotProxied) {
+			t.Fatalf("%+v strict = %v, want ErrNotProxied", opts, err)
+		}
+		if !opts.DropsUDP(dest) {
+			t.Fatalf("%+v strict DropsUDP = false", opts)
+		}
+
+		// A destination in the bypass list stays direct in strict mode.
+		opts.Bypass = mustPolicy(t, "127.0.0.0/8")
+		conn, err = DialUDP(ctx, opts, dest)
+		if err != nil {
+			t.Fatalf("%+v strict, listed destination = %v, want a direct dial", opts, err)
+		}
+		conn.Close()
+		if opts.DropsUDP(dest) {
+			t.Fatalf("%+v strict DropsUDP for a listed destination = true", opts)
+		}
+	}
+
+	socks := Options{Proxy: "socks5://127.0.0.1:1", ProxyUDP: true, Strict: true, Bypass: empty}
+	if socks.DropsUDP(dest) {
+		t.Fatal("UDP that the SOCKS5 proxy carries must not be dropped")
+	}
+}
+
+func TestDropsICMP(t *testing.T) {
+	ip := net.ParseIP("1.1.1.1")
+	lan := net.ParseIP("192.168.1.88")
+	opts := Options{Proxy: "socks5://127.0.0.1:1", Bypass: mustPolicy(t, "192.168.0.0/16")}
+	if opts.DropsICMP(ip) || opts.DropsICMP(lan) {
+		t.Fatal("non-strict mode must not drop ICMP")
+	}
+	opts.Strict = true
+	if !opts.DropsICMP(ip) {
+		t.Fatal("strict mode must drop ICMP outside the bypass list")
+	}
+	if opts.DropsICMP(lan) {
+		t.Fatal("strict mode must keep ICMP to the bypass list")
+	}
+	if (Options{Strict: true}).DropsICMP(ip) {
+		t.Fatal("without a proxy nothing is dropped")
+	}
 }

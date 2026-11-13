@@ -1,8 +1,10 @@
 package forwarder
 
 import (
+	"net"
 	"sync"
 
+	"github.com/containers/gvisor-tap-vsock/pkg/services/netproxy"
 	log "github.com/sirupsen/logrus"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
@@ -14,8 +16,24 @@ type Forwarder struct {
 	stack   *stack.Stack
 }
 
-func ICMP(s *stack.Stack, nat map[tcpip.Address]tcpip.Address, natLock *sync.Mutex) *Forwarder {
+// ICMP creates an ICMP forwarder that sends guest echo requests from the host.
+// In strict proxy mode (opts.Strict with a proxy), only NAT targets and
+// destinations in the bypass list are reached; other echoes are dropped.
+func ICMP(s *stack.Stack, nat map[tcpip.Address]tcpip.Address, natLock *sync.Mutex, opts netproxy.Options) *Forwarder {
 	return NewForwarder(s, func(r *ICMPForwarderRequest) {
+		// HandlePacket passes ownership of one reference (pkt.IncRef()).
+		// handlePingRequest releases it. Every path that does not hand the
+		// packet off must release that reference here: strict-mode drops,
+		// loopback, broadcast, a missing packet, a short header, and any
+		// ICMP type other than echo.
+		pkt := r.Packet()
+		handedOff := false
+		defer func() {
+			if pkt != nil && !handedOff {
+				pkt.DecRef()
+			}
+		}()
+
 		localAddress := r.ID().LocalAddress
 
 		// Skip forwarding for addresses that should be handled locally
@@ -24,13 +42,12 @@ func ICMP(s *stack.Stack, nat map[tcpip.Address]tcpip.Address, natLock *sync.Mut
 		}
 
 		// Apply NAT translation if needed
-		natLock.Lock()
-		if replaced, ok := nat[localAddress]; ok {
-			localAddress = replaced
+		localAddress, natted := translate(nat, natLock, localAddress)
+		if !icmpAllowed(opts, natted, net.IP(localAddress.AsSlice())) {
+			log.Debugf("strict proxy mode: dropping ICMP to %s", localAddress)
+			return
 		}
-		natLock.Unlock()
 
-		pkt := r.Packet()
 		if pkt == nil {
 			log.Warningf("Dropping ICMP packet from VM (no packet data)")
 			return
@@ -50,7 +67,9 @@ func ICMP(s *stack.Stack, nat map[tcpip.Address]tcpip.Address, natLock *sync.Mut
 			return
 		}
 
-		// This is a PING request - forward it using unprivileged ICMP sockets
+		// This is a PING request - forward it using unprivileged ICMP sockets.
+		// handlePingRequest takes the reference.
+		handedOff = true
 		go handlePingRequest(s, r, localAddress, icmpHeader, pkt)
 	})
 }

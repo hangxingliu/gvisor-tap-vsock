@@ -71,17 +71,34 @@ type Configuration struct {
 	// Supported schemes are http, https, and socks5.
 	// https uses HTTP CONNECT on a plain TCP connection to the proxy; the
 	// proxy session itself is not wrapped in TLS.
-	// Loopback, link-local, and private destinations bypass the proxy.
+	// Destinations in the bypass list (ProxyBypass) and NAT targets are
+	// reached directly.
 	Proxy string `yaml:"proxy,omitempty"`
+
+	// ProxyBypass, when set, replaces the built-in bypass list (loopback,
+	// link-local, and private ranges). It is a comma-separated list of "*",
+	// CIDRs, "CIDR:port" (IPv4), and "[CIDR]:port". An empty string bypasses
+	// nothing.
+	ProxyBypass *string `yaml:"proxyBypass,omitempty"`
 
 	// ProxyUDP routes outbound UDP through Proxy. Only socks5:// proxies
 	// support UDP. Ignored when Proxy is empty or uses another scheme.
 	ProxyUDP bool `yaml:"proxyUDP,omitempty"`
 
+	// StrictProxy drops guest traffic that Proxy cannot carry instead of
+	// sending it directly: UDP (unless ProxyUDP with a socks5 Proxy), ICMP,
+	// and DNS (unless sent through a socks5 Proxy). Destinations in the
+	// bypass list and NAT targets are still reached directly. Ignored when
+	// Proxy is empty.
+	StrictProxy bool `yaml:"strictProxy,omitempty"`
+
+	// NoProxyDNS keeps DNS out of a socks5 Proxy. By default the gateway
+	// sends forwarded queries through a socks5 Proxy as DNS-over-TCP.
+	// http proxies never carry DNS.
+	NoProxyDNS bool `yaml:"noProxyDNS,omitempty"`
+
 	// DNSUpstreams, when non-empty, replaces the host resolver for queries
 	// the gateway forwards. An address may omit the port; 53 is used then.
-	// With a socks5 Proxy, queries to non-local upstreams are tunnelled
-	// through that proxy. http proxies do not carry DNS.
 	DNSUpstreams []string `yaml:"dnsUpstreams,omitempty"`
 }
 

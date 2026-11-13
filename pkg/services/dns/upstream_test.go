@@ -12,7 +12,7 @@ import (
 
 func TestNewLeavesDefaultResolverUntouched(t *testing.T) {
 	for _, proxy := range []string{"", "http://127.0.0.1:8080", "https://proxy.example:8443", "not a url"} {
-		server, err := New(nil, nil, nil, proxy, nil)
+		server, err := New(nil, nil, nil, UpstreamOptions{Proxy: proxy})
 		if err != nil {
 			t.Fatalf("New(proxy=%q) error = %v", proxy, err)
 		}
@@ -23,7 +23,7 @@ func TestNewLeavesDefaultResolverUntouched(t *testing.T) {
 }
 
 func TestNewNormalizesCustomUpstreams(t *testing.T) {
-	server, err := New(nil, nil, nil, "", []string{"8.8.8.8", "1.1.1.1:5353", "  ", "[2001:db8::1]"})
+	server, err := New(nil, nil, nil, UpstreamOptions{DNSUpstreams: []string{"8.8.8.8", "1.1.1.1:5353", "  ", "[2001:db8::1]"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -46,7 +46,7 @@ func TestCustomUpstreamAnswersAndRawRecords(t *testing.T) {
 	addr, done := listenFixtureDNS(t, "udp")
 	defer done()
 
-	server, err := New(nil, nil, nil, "", []string{addr})
+	server, err := New(nil, nil, nil, UpstreamOptions{DNSUpstreams: []string{addr}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -80,7 +80,7 @@ func TestSocks5DNSAndLocalBypass(t *testing.T) {
 	proxyURL, doneProxy := startSocks5ConnectServer(t, &proxyDials, dnsAddr)
 	defer doneProxy()
 
-	server, err := New(nil, nil, nil, proxyURL, []string{"8.8.8.8"})
+	server, err := New(nil, nil, nil, UpstreamOptions{Proxy: proxyURL, ProxyDNS: true, DNSUpstreams: []string{"8.8.8.8"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -107,7 +107,7 @@ func TestSocks5DNSAndLocalBypass(t *testing.T) {
 	udpAddr, doneUDP := listenFixtureDNS(t, "udp")
 	defer doneUDP()
 	proxyDials.Store(0)
-	bypassed, err := New(nil, nil, nil, proxyURL, []string{udpAddr})
+	bypassed, err := New(nil, nil, nil, UpstreamOptions{Proxy: proxyURL, ProxyDNS: true, DNSUpstreams: []string{udpAddr}})
 	if err != nil {
 		t.Fatal(err)
 	}

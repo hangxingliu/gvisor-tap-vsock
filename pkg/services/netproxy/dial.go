@@ -1,14 +1,15 @@
 // Package netproxy dials TCP and UDP destinations either directly or through
 // an HTTP CONNECT or SOCKS5 proxy.
 //
-// An empty proxy URL, and any destination covered by the built-in NO_PROXY
-// policy, is always dialled directly. The direct path is what upstream
-// gvisor-tap-vsock does when no proxy is configured.
+// An empty proxy URL, and any destination covered by the NO_PROXY policy, is
+// always dialled directly. The direct path is what upstream gvisor-tap-vsock
+// does when no proxy is configured.
 package netproxy
 
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -21,21 +22,73 @@ import (
 	socks5 "github.com/txthinking/socks5"
 )
 
-// DialTCP dials dest. When proxy is empty, or dest is covered by the NO_PROXY
-// policy, the dial is direct and obeys ctx. Otherwise the connection is made
-// through an http://, https://, or socks5:// proxy.
+// ErrNotProxied is returned in strict mode for traffic that cannot be carried
+// by the proxy and is not covered by the NO_PROXY policy. Callers drop it.
+var ErrNotProxied = errors.New("strict proxy mode: traffic cannot be sent through the proxy")
+
+// Options configures how outbound guest traffic leaves the host.
+type Options struct {
+	// Proxy is an http://, https://, or socks5:// URL. Empty means direct.
+	Proxy string
+	// ProxyUDP sends UDP through a socks5:// Proxy.
+	ProxyUDP bool
+	// Strict drops traffic that cannot be sent through Proxy instead of
+	// sending it directly. Destinations in Bypass are still dialled directly.
+	Strict bool
+	// Bypass lists the destinations that are dialled directly. nil means
+	// noproxy.Default().
+	Bypass *noproxy.Policy
+}
+
+// Bypasses reports whether dest ("host:port") is dialled directly because no
+// proxy is set or the NO_PROXY policy covers it.
+func (o Options) Bypasses(dest string) bool {
+	return o.Proxy == "" || o.Bypass.Bypass(dest)
+}
+
+// BypassesIP is Bypasses for a destination without a port (ICMP).
+func (o Options) BypassesIP(ip net.IP) bool {
+	return o.Proxy == "" || o.Bypass.BypassIP(ip, 0)
+}
+
+// CarriesUDP reports whether UDP can be sent through Proxy.
+func (o Options) CarriesUDP() bool {
+	return o.ProxyUDP && isSOCKS5(o.Proxy)
+}
+
+// DropsUDP reports whether UDP to dest is dropped: strict mode, a proxy that
+// cannot carry UDP, and a destination outside the NO_PROXY policy.
+func (o Options) DropsUDP(dest string) bool {
+	return o.Strict && !o.Bypasses(dest) && !o.CarriesUDP()
+}
+
+// DropsICMP reports whether an ICMP echo to ip is dropped: strict mode and a
+// destination outside the NO_PROXY policy. Proxies never carry ICMP.
+func (o Options) DropsICMP(ip net.IP) bool {
+	return o.Strict && !o.BypassesIP(ip)
+}
+
+func isSOCKS5(proxy string) bool {
+	u, err := url.Parse(proxy)
+	return err == nil && strings.EqualFold(u.Scheme, "socks5")
+}
+
+// DialTCP dials dest. When opts.Proxy is empty, or dest is covered by the
+// NO_PROXY policy, the dial is direct and obeys ctx. Otherwise the connection
+// is made through an http://, https://, or socks5:// proxy. A failed proxy
+// dial is returned as an error; it never falls back to a direct dial.
 //
 // https:// uses HTTP CONNECT on a plain TCP connection to the proxy. The
 // proxy session itself is not wrapped in TLS.
-func DialTCP(ctx context.Context, proxy, dest string) (net.Conn, error) {
+func DialTCP(ctx context.Context, opts Options, dest string) (net.Conn, error) {
 	ctx = nonNil(ctx)
-	if proxy == "" || noproxy.Bypass(dest) {
+	if opts.Bypasses(dest) {
 		return (&net.Dialer{}).DialContext(ctx, "tcp", dest)
 	}
 
-	u, err := url.Parse(proxy)
+	u, err := url.Parse(opts.Proxy)
 	if err != nil {
-		return nil, fmt.Errorf("invalid proxy URL %q: %w", proxy, err)
+		return nil, fmt.Errorf("invalid proxy URL: %w", err)
 	}
 
 	switch strings.ToLower(u.Scheme) {
@@ -48,18 +101,25 @@ func DialTCP(ctx context.Context, proxy, dest string) (net.Conn, error) {
 	}
 }
 
-// DialUDP dials dest. UDP is sent through the proxy only when proxyUDP is set,
-// proxy is a socks5:// URL, and dest is not covered by the NO_PROXY policy.
-// HTTP proxies cannot carry UDP.
-func DialUDP(ctx context.Context, proxy string, proxyUDP bool, dest string) (net.Conn, error) {
+// DialUDP dials dest. UDP is sent through the proxy when opts.ProxyUDP is set,
+// opts.Proxy is a socks5:// URL, and dest is not covered by the NO_PROXY
+// policy. HTTP proxies cannot carry UDP. UDP that the proxy cannot carry is
+// sent directly, or rejected with ErrNotProxied in strict mode.
+func DialUDP(ctx context.Context, opts Options, dest string) (net.Conn, error) {
 	ctx = nonNil(ctx)
-	if !proxyUDP || proxy == "" || noproxy.Bypass(dest) {
+	if opts.Bypasses(dest) {
+		return (&net.Dialer{}).DialContext(ctx, "udp", dest)
+	}
+	if !opts.ProxyUDP {
+		if opts.Strict {
+			return nil, ErrNotProxied
+		}
 		return (&net.Dialer{}).DialContext(ctx, "udp", dest)
 	}
 
-	u, err := url.Parse(proxy)
+	u, err := url.Parse(opts.Proxy)
 	if err != nil {
-		return nil, fmt.Errorf("invalid proxy URL %q: %w", proxy, err)
+		return nil, fmt.Errorf("invalid proxy URL: %w", err)
 	}
 	if !strings.EqualFold(u.Scheme, "socks5") {
 		return nil, fmt.Errorf("UDP proxy only supported for socks5://, got %q", u.Scheme)

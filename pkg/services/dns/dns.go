@@ -3,6 +3,7 @@ package dns
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -42,6 +43,42 @@ type dnsHandler struct {
 	// It is set for a SOCKS5 proxy so those queries are tunnelled too.
 	// network is "udp" or "tcp". A nil dialer means dns.Client dials directly.
 	dialNameserver func(ctx context.Context, network, address string) (net.Conn, error)
+	// refuseAll answers every query not handled by a local zone with
+	// REFUSED. It is set when strict proxy mode leaves no usable upstream.
+	refuseAll bool
+	// servfailOnError answers SERVFAIL, instead of NXDOMAIN, when a typed
+	// lookup fails for any reason other than a missing name. It is set for
+	// the configured upstreams, so a proxy or upstream failure is not
+	// mistaken for a missing name.
+	servfailOnError bool
+}
+
+// upstreamLookupTimeout bounds a typed lookup against the configured
+// upstreams. Go's resolver retries for longer than a guest resolver waits
+// (glibc gives up after 5 seconds), so without a bound a proxy or upstream
+// failure would time out in the guest instead of being answered SERVFAIL.
+const upstreamLookupTimeout = 4 * time.Second
+
+// lookupContext returns the context for the typed lookups of one query.
+// Only the configured upstreams are bounded; the host system resolver keeps
+// its own timeouts.
+func (h *dnsHandler) lookupContext() (context.Context, context.CancelFunc) {
+	if h.servfailOnError {
+		return context.WithTimeout(context.Background(), upstreamLookupTimeout)
+	}
+	return context.Background(), func() {}
+}
+
+// lookupErrorRcode returns the response code for a failed typed lookup.
+func (h *dnsHandler) lookupErrorRcode(err error) int {
+	if !h.servfailOnError {
+		return dns.RcodeNameError
+	}
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) && dnsErr.IsNotFound {
+		return dns.RcodeNameError
+	}
+	return dns.RcodeServerFailure
 }
 
 func (h *dnsHandler) handle(w dns.ResponseWriter, r *dns.Msg, responseMessageSize int) {
@@ -136,17 +173,23 @@ func splitTxt(s string) []string {
 	return c
 }
 func (h *dnsHandler) addAnswers(m *dns.Msg) {
+	ctx, cancel := h.lookupContext()
+	defer cancel()
 	for _, q := range m.Question {
 		if done := h.addLocalAnswers(m, q); done {
+			return
+		}
+		if h.refuseAll {
+			m.Rcode = dns.RcodeRefused
 			return
 		}
 
 		resolver := h.upstream
 		switch q.Qtype {
 		case dns.TypeA:
-			ips, err := resolver.LookupIPAddr(context.TODO(), q.Name)
+			ips, err := resolver.LookupIPAddr(ctx, q.Name)
 			if err != nil {
-				m.Rcode = dns.RcodeNameError
+				m.Rcode = h.lookupErrorRcode(err)
 				return
 			}
 			for _, ip := range ips {
@@ -164,9 +207,9 @@ func (h *dnsHandler) addAnswers(m *dns.Msg) {
 				})
 			}
 		case dns.TypeCNAME:
-			cname, err := resolver.LookupCNAME(context.TODO(), q.Name)
+			cname, err := resolver.LookupCNAME(ctx, q.Name)
 			if err != nil {
-				m.Rcode = dns.RcodeNameError
+				m.Rcode = h.lookupErrorRcode(err)
 				return
 			}
 			m.Answer = append(m.Answer, &dns.CNAME{
@@ -179,9 +222,9 @@ func (h *dnsHandler) addAnswers(m *dns.Msg) {
 				Target: cname,
 			})
 		case dns.TypeMX:
-			records, err := resolver.LookupMX(context.TODO(), q.Name)
+			records, err := resolver.LookupMX(ctx, q.Name)
 			if err != nil {
-				m.Rcode = dns.RcodeNameError
+				m.Rcode = h.lookupErrorRcode(err)
 				return
 			}
 			for _, mx := range records {
@@ -197,9 +240,9 @@ func (h *dnsHandler) addAnswers(m *dns.Msg) {
 				})
 			}
 		case dns.TypeNS:
-			records, err := resolver.LookupNS(context.TODO(), q.Name)
+			records, err := resolver.LookupNS(ctx, q.Name)
 			if err != nil {
-				m.Rcode = dns.RcodeNameError
+				m.Rcode = h.lookupErrorRcode(err)
 				return
 			}
 			for _, ns := range records {
@@ -214,9 +257,9 @@ func (h *dnsHandler) addAnswers(m *dns.Msg) {
 				})
 			}
 		case dns.TypeSRV:
-			_, records, err := resolver.LookupSRV(context.TODO(), "", "", q.Name)
+			_, records, err := resolver.LookupSRV(ctx, "", "", q.Name)
 			if err != nil {
-				m.Rcode = dns.RcodeNameError
+				m.Rcode = h.lookupErrorRcode(err)
 				return
 			}
 			for _, srv := range records {
@@ -234,9 +277,9 @@ func (h *dnsHandler) addAnswers(m *dns.Msg) {
 				})
 			}
 		case dns.TypeTXT:
-			txts, err := resolver.LookupTXT(context.TODO(), q.Name)
+			txts, err := resolver.LookupTXT(ctx, q.Name)
 			if err != nil {
-				m.Rcode = dns.RcodeNameError
+				m.Rcode = h.lookupErrorRcode(err)
 				return
 			}
 
@@ -345,27 +388,42 @@ type Server struct {
 
 // New creates a DNS server.
 //
-// proxy is an optional proxy URL. Only socks5:// changes DNS behavior: queries
-// for non-local upstreams are tunnelled through it, which avoids leaking them
-// to the host resolver. http:// and https:// proxies are ignored here because
-// they cannot carry DNS. An empty proxy keeps the host resolver.
+// upstream selects where queries not answered by a local zone go. With a
+// socks5:// proxy and ProxyDNS, queries for upstreams outside the bypass list
+// are tunnelled through the proxy as DNS-over-TCP; a proxy failure answers
+// SERVFAIL and never falls back to a direct query. Without ProxyDNS the host
+// resolves directly: DNSUpstreams when given, otherwise the host system
+// resolver. In strict mode (Strict with a proxy and without ProxyDNS) only
+// upstreams in the bypass list are used; when none is, every query is
+// answered with REFUSED.
 //
-// dnsUpstreams, when non-empty, replaces the host's nameservers. A bare IP
-// without a port uses port 53. With a socks5 proxy, those servers are dialled
-// through the proxy unless the NO_PROXY policy says to dial them directly.
-func New(udpConn net.PacketConn, tcpLn net.Listener, zones []types.Zone, proxy string, dnsUpstreams []string) (*Server, error) {
-	spec := buildUpstreamSpec(proxy, dnsUpstreams)
+// DNSUpstreams, when non-empty, replaces the host's nameservers. A bare IP
+// without a port uses port 53.
+func New(udpConn net.PacketConn, tcpLn net.Listener, zones []types.Zone, upstream UpstreamOptions) (*Server, error) {
+	spec, err := buildUpstreamSpec(upstream)
+	if err != nil {
+		return nil, err
+	}
 	if !spec.customized {
 		return NewWithUpstreamResolver(udpConn, tcpLn, zones, &net.Resolver{PreferGo: false})
 	}
+	return newWithSpec(udpConn, tcpLn, zones, spec), nil
+}
+
+func newWithSpec(udpConn net.PacketConn, tcpLn net.Listener, zones []types.Zone, spec upstreamSpec) *Server {
 	handler := &dnsHandler{
-		zones:          zones,
-		upstream:       spec.resolver,
-		nameservers:    spec.nameservers,
-		client:         &dns.Client{},
-		dialNameserver: spec.dialNameserver,
+		zones:           zones,
+		nameservers:     spec.nameservers,
+		client:          &dns.Client{},
+		dialNameserver:  spec.dialNameserver,
+		refuseAll:       spec.refuseAll,
+		servfailOnError: true,
 	}
-	return &Server{udpConn: udpConn, tcpLn: tcpLn, handler: handler}, nil
+	// A nil *net.Resolver stored in the interface would not be nil.
+	if spec.resolver != nil {
+		handler.upstream = spec.resolver
+	}
+	return &Server{udpConn: udpConn, tcpLn: tcpLn, handler: handler}
 }
 
 func NewWithUpstreamResolver(udpConn net.PacketConn, tcpLn net.Listener, zones []types.Zone, upstream upstreamResolver) (*Server, error) {
